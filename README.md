@@ -1,139 +1,168 @@
-# Contactbook
+# Contactbook 📇 — Apple Contacts CLI + MCP server
 
-![Contactbook Logo](assets/logo.svg)
+[![Swift 6.0](https://img.shields.io/badge/Swift-6.0-F05138?logo=swift&logoColor=white&style=flat-square)](https://swift.org/)
+[![macOS 13+](https://img.shields.io/badge/macOS-13+-0078d7?logo=apple&logoColor=white&style=flat-square)](https://www.apple.com/macos/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-ffd60a?style=flat-square)](https://opensource.org/licenses/MIT)
+[![MCP Server](https://img.shields.io/badge/MCP-Server-2ea44f?style=flat-square)](https://modelcontextprotocol.io/)
 
-Contactbook - your contacts, at your command
+Contactbook brings Apple Contacts automation to macOS through a Swift CLI and MCP server. List, search, create, update, and delete contacts — from the terminal or any MCP client.
 
-Contactbook is a macOS command-line interface (CLI) and Model Context Protocol (MCP) server for Apple Contacts. It allows you to manage your contacts directly from the terminal or through AI agents.
+## What you get
 
-## Requirements
+| Feature | Description |
+|---------|-------------|
+| **List Contacts** | Browse all contacts with optional limit |
+| **Search Contacts** | Find by name, email, phone, or organization |
+| **Get Contact** | Retrieve full contact details by ID |
+| **Create Contact** | Add new contacts with all fields |
+| **Update Contact** | Modify existing contact properties |
+| **Delete Contact** | Remove contacts (with confirmation) |
+| **Groups** | List groups and group members |
+| **Lookup** | Quick lookup by name or identifier |
+| **MCP Server** | All features exposed as MCP tools for AI agents |
 
-- macOS 26+ (Tahoe)
-- Swift 6.2+
-
-## Installation
-
-### From Source
-
-Clone the repository and build using Swift Package Manager:
+## Install
 
 ```bash
+# Clone and build
 git clone https://github.com/RyanLisse/Contactbook.git
 cd Contactbook
-./build.sh
+swift build -c release
+
+# Install to PATH
+cp .build/release/contactbook /usr/local/bin/contactbook
 ```
 
-The binary will be available at `.build/arm64-apple-macosx/release/contactbook`. You can move it to your PATH:
+## Quick start
 
 ```bash
-cp .build/arm64-apple-macosx/release/contactbook /usr/local/bin/
-```
-
-### Permissions Setup
-
-**Important:** macOS requires Contacts permission for this tool to work. After building:
-
-1. **For properly signed binaries:** Run the tool once - macOS will show a permission prompt automatically.
-
-2. **For adhoc-signed binaries (development):** 
-   - The permission prompt may not appear automatically
-   - Go to **System Settings > Privacy & Security > Contacts**
-   - Look for "contactbook" in the list and enable it
-   - If it doesn't appear, you may need to use a valid Apple Developer certificate
-
-3. **Troubleshooting:**
-   - If you see "Access Denied" errors, check System Settings > Privacy & Security > Contacts
-   - Ensure the binary is properly signed with entitlements (the `build.sh` script handles this)
-   - For development, consider using an Apple Development certificate instead of adhoc signing
-
-## CLI Usage
-
-### List Contacts
-
-```bash
+# List contacts
 contactbook contacts list --limit 10
-```
 
-### Search Contacts
-
-```bash
+# Search contacts
 contactbook contacts search "John"
-```
 
-### Get Contact by ID
+# Get contact by ID
+contactbook contacts get <contact-id> --json
 
-```bash
-contactbook contacts get "UUID:ABPerson"
-```
+# Create a contact
+contactbook contacts create \
+  --firstName "John" \
+  --lastName "Doe" \
+  --email "john@example.com" \
+  --phone "+1234567890"
 
-### Create a Contact
+# Update a contact
+contactbook contacts update <contact-id> --jobTitle "Engineer"
 
-```bash
-contactbook contacts create --first "John" --last "Doe" --phone "+1234567890" --email "john@example.com" --org "Acme Inc"
-```
+# Delete a contact
+contactbook contacts delete <contact-id> --force
 
-### Update a Contact
-
-```bash
-contactbook contacts update "UUID:ABPerson" --phone "+0987654321"
-```
-
-### Delete a Contact
-
-```bash
-contactbook contacts delete "UUID:ABPerson"
-```
-
-### List Groups
-
-```bash
+# List groups
 contactbook groups list
+
+# Quick lookup
+contactbook lookup "John Doe"
 ```
 
-### Get Group Members
+| Command | Key flags | What it does |
+|---------|-----------|--------------|
+| `contacts list` | `--limit`, `--json` | List all contacts |
+| `contacts search` | `<query>`, `--json` | Search contacts |
+| `contacts get` | `<id>`, `--json` | Get contact by ID |
+| `contacts create` | `--firstName`, `--lastName`, etc. | Create new contact |
+| `contacts update` | `<id>`, field options | Update contact |
+| `contacts delete` | `<id>`, `--force` | Delete contact |
+| `groups list` | `--json` | List all groups |
+| `groups members` | `<group-id>` | List group members |
+| `lookup` | `<query>` | Quick name/ID lookup |
+| `mcp serve` | - | Start MCP server |
+
+## MCP Server
+
+Start the MCP server for AI agent integration:
 
 ```bash
-contactbook groups members "Family"
+contactbook mcp serve
 ```
 
-## MCP Server Setup
+### MCP Tools
 
-Contactbook can run as an MCP server, enabling AI agents (like Claude Desktop) to interact with your Apple Contacts.
+| Tool | Description |
+|------|-------------|
+| `contacts_list` | List all contacts |
+| `contacts_search` | Search contacts by query |
+| `contacts_get` | Get contact by ID |
+| `contacts_create` | Create new contact |
+| `contacts_update` | Update existing contact |
+| `contacts_delete` | Delete contact |
+| `groups_list` | List all groups |
+| `groups_members` | Get group members |
 
-### Configuration for Claude Desktop
-
-Add the following to your `claude_desktop_config.json`:
+### Claude Desktop Config
 
 ```json
 {
   "mcpServers": {
     "contactbook": {
-      "command": "contactbook",
+      "command": "/usr/local/bin/contactbook",
       "args": ["mcp", "serve"]
     }
   }
 }
 ```
 
-### Available MCP Tools
+## Architecture
 
-The server exposes 8 tools for managing contacts:
+Follows the [Peekaboo](https://github.com/steipete/Peekaboo) architecture standard:
 
-1. **contacts_list**: List contacts with optional limit. Optional: `limit` (int, default 50).
-2. **contacts_get**: Get a contact by ID. Required: `id` (string).
-3. **contacts_search**: Search contacts by name, email, phone, or organization. Required: `query` (string).
-4. **contacts_create**: Create a new contact. Optional: `first_name`, `last_name`, `phone`, `email`, `organization` (all strings).
-5. **contacts_update**: Update an existing contact. Required: `id` (string). Optional: `first_name`, `last_name`, `phone`, `email`, `organization`.
-6. **contacts_delete**: Delete a contact by ID. Required: `id` (string).
-7. **groups_list**: List all contact groups with member counts.
-8. **groups_members**: Get members of a specific group. Required: `group_name` (string).
+```
+Sources/
+├── Core/           # ContactbookCore - framework-agnostic library
+│   ├── Models/     # Contact, ContactGroup models
+│   ├── Services/   # ContactsService (Contacts framework wrapper)
+│   └── Errors/     # ContactsError
+├── CLI/            # ContactbookCLI - ArgumentParser commands
+│   └── Commands/   # Contacts, Groups, Lookup, MCP commands
+├── MCP/            # ContactbookMCP - MCP server with handler pattern
+│   └── Handlers/   # ToolHandler
+└── Executable/     # Main entry point
+```
 
-## Performance Notes
+## Requirements
 
-- Default contact limit is 50 to handle large contact databases efficiently
-- Uses AppleScript with optimized JSON output for fast querying
-- Contact IDs are in the format `UUID:ABPerson`
+- **macOS 13+** (Ventura or later)
+- **Swift 6.0+** toolchain
+- **Contacts permissions** (prompted on first run)
+
+## Development
+
+```bash
+# Build
+swift build
+
+# Run CLI
+swift run contactbook --help
+
+# Test
+swift test
+```
+
+### Swift 6 Settings
+
+All targets use strict concurrency:
+
+```swift
+.enableExperimentalFeature("StrictConcurrency")
+.enableUpcomingFeature("ExistentialAny")
+.enableUpcomingFeature("NonisolatedNonsendingByDefault")
+```
+
+## Known Issues
+
+- **Signing required for full performance**: Without a paid Apple Developer account, the Contacts framework falls back to AppleScript which is slow for large contact lists (4500+ contacts = timeout)
+- First run triggers macOS Contacts permission prompts
 
 ## License
 
-This project is licensed under the MIT License.
+MIT

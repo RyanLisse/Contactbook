@@ -1,8 +1,9 @@
 import ArgumentParser
+import Core
 
-public struct Contactbook: AsyncParsableCommand {
+public struct contactbook: AsyncParsableCommand {
     public init() {}
-    
+
     public static let configuration = CommandConfiguration(
         commandName: "contactbook",
         abstract: "Apple Contacts CLI and MCP server",

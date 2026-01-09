@@ -1,8 +1,10 @@
 import ArgumentParser
 import Foundation
+import Core
 
-struct GroupsCommand: AsyncParsableCommand {
-    static let configuration = CommandConfiguration(
+public struct GroupsCommand: AsyncParsableCommand {
+    public init() {}
+    public static let configuration = CommandConfiguration(
         commandName: "groups",
         abstract: "Manage contact groups",
         subcommands: [
@@ -13,18 +15,21 @@ struct GroupsCommand: AsyncParsableCommand {
     )
 }
 
-struct ListGroups: AsyncParsableCommand {
-    static let configuration = CommandConfiguration(
+public struct ListGroups: AsyncParsableCommand {
+    public static let configuration = CommandConfiguration(
         commandName: "list",
         abstract: "List all groups"
     )
-    
+
     @Flag(name: .long, help: "Output as JSON")
     var json: Bool = false
-    
-    func run() async throws {
-        let groups = try await ContactsService.shared.listGroups()
-        
+
+    public init() {}
+
+    public func run() async throws {
+        let service = ContactsService.shared
+        let groups = try await service.listGroups()
+
         if json {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -46,21 +51,24 @@ struct ListGroups: AsyncParsableCommand {
     }
 }
 
-struct GetGroupMembers: AsyncParsableCommand {
-    static let configuration = CommandConfiguration(
+public struct GetGroupMembers: AsyncParsableCommand {
+    public static let configuration = CommandConfiguration(
         commandName: "members",
         abstract: "Get members of a group"
     )
-    
+
     @Argument(help: "Group name")
     var name: String
-    
+
     @Flag(name: .long, help: "Output as JSON")
     var json: Bool = false
-    
-    func run() async throws {
-        let contacts = try await ContactsService.shared.getGroupMembers(groupName: name)
-        
+
+    public init() {}
+
+    public func run() async throws {
+        let service = ContactsService.shared
+        let contacts = try await service.getGroupMembers(groupName: name)
+
         if json {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]

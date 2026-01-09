@@ -1,8 +1,10 @@
 import ArgumentParser
 import Foundation
+import Core
 
-struct ContactsCommand: AsyncParsableCommand {
-    static let configuration = CommandConfiguration(
+public struct ContactsCommand: AsyncParsableCommand {
+    public init() {}
+    public static let configuration = CommandConfiguration(
         commandName: "contacts",
         abstract: "Manage contacts",
         subcommands: [
@@ -17,21 +19,23 @@ struct ContactsCommand: AsyncParsableCommand {
     )
 }
 
-struct ListContacts: AsyncParsableCommand {
-    static let configuration = CommandConfiguration(
+public struct ListContacts: AsyncParsableCommand {
+    public init() {}
+    public static let configuration = CommandConfiguration(
         commandName: "list",
         abstract: "List all contacts"
     )
-    
+
     @Option(name: .shortAndLong, help: "Maximum number of contacts to return")
     var limit: Int?
-    
+
     @Flag(name: .long, help: "Output as JSON")
     var json: Bool = false
-    
-    func run() async throws {
-        let contacts = try await ContactsService.shared.listContacts(limit: limit)
-        
+
+    public func run() async throws {
+        let service = ContactsService.shared
+        let contacts = try await service.listContacts(limit: limit)
+
         if json {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -50,21 +54,23 @@ struct ListContacts: AsyncParsableCommand {
     }
 }
 
-struct SearchContacts: AsyncParsableCommand {
-    static let configuration = CommandConfiguration(
+public struct SearchContacts: AsyncParsableCommand {
+    public init() {}
+    public static let configuration = CommandConfiguration(
         commandName: "search",
         abstract: "Search contacts by name, email, phone, or organization"
     )
-    
+
     @Argument(help: "Search query")
     var query: String
-    
+
     @Flag(name: .long, help: "Output as JSON")
     var json: Bool = false
-    
-    func run() async throws {
-        let contacts = try await ContactsService.shared.searchContacts(query: query)
-        
+
+    public func run() async throws {
+        let service = ContactsService.shared
+        let contacts = try await service.searchContacts(query: query)
+
         if json {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -83,23 +89,25 @@ struct SearchContacts: AsyncParsableCommand {
     }
 }
 
-struct GetContact: AsyncParsableCommand {
-    static let configuration = CommandConfiguration(
+public struct GetContact: AsyncParsableCommand {
+    public init() {}
+    public static let configuration = CommandConfiguration(
         commandName: "get",
         abstract: "Get a contact by ID"
     )
-    
+
     @Argument(help: "Contact ID")
     var id: String
-    
+
     @Flag(name: .long, help: "Output as JSON")
     var json: Bool = false
-    
-    func run() async throws {
-        guard let contact = try await ContactsService.shared.getContact(id: id) else {
+
+    public func run() async throws {
+        let service = ContactsService.shared
+        guard let contact = try await service.getContact(id: id) else {
             throw ContactsError.contactNotFound
         }
-        
+
         if json {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -111,42 +119,44 @@ struct GetContact: AsyncParsableCommand {
     }
 }
 
-struct CreateContact: AsyncParsableCommand {
-    static let configuration = CommandConfiguration(
+public struct CreateContact: AsyncParsableCommand {
+    public init() {}
+    public static let configuration = CommandConfiguration(
         commandName: "create",
         abstract: "Create a new contact"
     )
-    
+
     @Option(name: .long, help: "First name")
     var firstName: String?
-    
+
     @Option(name: .long, help: "Last name")
     var lastName: String?
-    
+
     @Option(name: .long, help: "Email address")
     var email: String?
-    
+
     @Option(name: .long, help: "Phone number")
     var phone: String?
-    
+
     @Option(name: .long, help: "Organization/company")
     var organization: String?
-    
+
     @Option(name: .long, help: "Job title")
     var jobTitle: String?
-    
+
     @Option(name: .long, help: "Note")
     var note: String?
-    
+
     @Flag(name: .long, help: "Output as JSON")
     var json: Bool = false
-    
-    func run() async throws {
+
+    public func run() async throws {
         guard firstName != nil || lastName != nil || organization != nil else {
             throw ContactsError.invalidInput("At least firstName, lastName, or organization is required")
         }
-        
-        let id = try await ContactsService.shared.createContact(
+
+        let service = ContactsService.shared
+        let id = try await service.createContact(
             firstName: firstName,
             lastName: lastName,
             email: email,
@@ -155,7 +165,7 @@ struct CreateContact: AsyncParsableCommand {
             jobTitle: jobTitle,
             note: note
         )
-        
+
         if json {
             print("{\"id\": \"\(id)\", \"success\": true}")
         } else {
@@ -164,35 +174,37 @@ struct CreateContact: AsyncParsableCommand {
     }
 }
 
-struct UpdateContact: AsyncParsableCommand {
-    static let configuration = CommandConfiguration(
+public struct UpdateContact: AsyncParsableCommand {
+    public init() {}
+    public static let configuration = CommandConfiguration(
         commandName: "update",
         abstract: "Update an existing contact"
     )
-    
+
     @Argument(help: "Contact ID")
     var id: String
-    
+
     @Option(name: .long, help: "First name")
     var firstName: String?
-    
+
     @Option(name: .long, help: "Last name")
     var lastName: String?
-    
+
     @Option(name: .long, help: "Organization/company")
     var organization: String?
-    
+
     @Option(name: .long, help: "Job title")
     var jobTitle: String?
-    
+
     @Option(name: .long, help: "Note")
     var note: String?
-    
+
     @Flag(name: .long, help: "Output as JSON")
     var json: Bool = false
-    
-    func run() async throws {
-        let success = try await ContactsService.shared.updateContact(
+
+    public func run() async throws {
+        let service = ContactsService.shared
+        let success = try await service.updateContact(
             id: id,
             firstName: firstName,
             lastName: lastName,
@@ -200,7 +212,7 @@ struct UpdateContact: AsyncParsableCommand {
             jobTitle: jobTitle,
             note: note
         )
-        
+
         if json {
             print("{\"success\": \(success)}")
         } else {
@@ -213,22 +225,23 @@ struct UpdateContact: AsyncParsableCommand {
     }
 }
 
-struct DeleteContact: AsyncParsableCommand {
-    static let configuration = CommandConfiguration(
+public struct DeleteContact: AsyncParsableCommand {
+    public init() {}
+    public static let configuration = CommandConfiguration(
         commandName: "delete",
         abstract: "Delete a contact"
     )
-    
+
     @Argument(help: "Contact ID")
     var id: String
-    
+
     @Flag(name: .long, help: "Skip confirmation")
     var force: Bool = false
-    
+
     @Flag(name: .long, help: "Output as JSON")
     var json: Bool = false
-    
-    func run() async throws {
+
+    public func run() async throws {
         if !force && !json {
             print("Are you sure you want to delete contact \(id)? (y/N) ", terminator: "")
             guard let response = readLine()?.lowercased(), response == "y" || response == "yes" else {
@@ -236,9 +249,10 @@ struct DeleteContact: AsyncParsableCommand {
                 return
             }
         }
-        
-        let success = try await ContactsService.shared.deleteContact(id: id)
-        
+
+        let service = ContactsService.shared
+        let success = try await service.deleteContact(id: id)
+
         if json {
             print("{\"success\": \(success)}")
         } else {
@@ -254,7 +268,7 @@ struct DeleteContact: AsyncParsableCommand {
 private func printContact(_ contact: Contact, verbose: Bool = false) {
     print("[\(contact.id)]")
     print("  Name: \(contact.fullName)")
-    
+
     if let org = contact.organization {
         if let title = contact.jobTitle {
             print("  Work: \(title) at \(org)")
@@ -264,20 +278,20 @@ private func printContact(_ contact: Contact, verbose: Bool = false) {
     } else if let title = contact.jobTitle {
         print("  Title: \(title)")
     }
-    
+
     if !contact.emails.isEmpty {
         print("  Email: \(contact.emails.joined(separator: ", "))")
     }
-    
+
     if !contact.phones.isEmpty {
         print("  Phone: \(contact.phones.joined(separator: ", "))")
     }
-    
+
     if verbose {
         if let birthday = contact.birthday {
             print("  Birthday: \(birthday)")
         }
-        
+
         if !contact.addresses.isEmpty {
             print("  Addresses:")
             for addr in contact.addresses {
@@ -285,11 +299,11 @@ private func printContact(_ contact: Contact, verbose: Bool = false) {
                 print("    - \(formatted)")
             }
         }
-        
+
         if let note = contact.note {
             print("  Note: \(note)")
         }
     }
-    
+
     print()
 }

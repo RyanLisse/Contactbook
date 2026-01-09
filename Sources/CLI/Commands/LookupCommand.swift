@@ -1,21 +1,24 @@
 import ArgumentParser
 import Foundation
+import Core
 
-struct LookupCommand: AsyncParsableCommand {
-    static let configuration = CommandConfiguration(
+public struct LookupCommand: AsyncParsableCommand {
+    public init() {}
+    public static let configuration = CommandConfiguration(
         commandName: "lookup",
         abstract: "Lookup a contact by phone number"
     )
-    
+
     @Argument(help: "Phone number to lookup (e.g., +31648502148)")
     var phoneNumber: String
-    
+
     @Flag(name: .long, help: "Output as JSON")
     var json: Bool = false
-    
-    func run() async throws {
-        let contact = try await ContactsService.shared.lookupByPhone(phoneNumber: phoneNumber)
-        
+
+    public func run() async throws {
+        let service = ContactsService.shared
+        let contact = try await service.lookupByPhone(phoneNumber: phoneNumber)
+
         if json {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
