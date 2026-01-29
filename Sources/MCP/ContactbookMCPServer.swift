@@ -31,5 +31,6 @@ public actor ContactbookMCPServer {
         }
 
         try await server.start(transport: transport)
+        await server.waitUntilCompleted()
     }
 }
