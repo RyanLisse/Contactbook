@@ -65,6 +65,19 @@ contactbook groups list
 contactbook lookup "John Doe"
 ```
 
+## Permissions
+
+```bash
+contactbook status               # check permission status
+contactbook authorize            # request permissions
+```
+
+## Output formats
+
+- `--json` emits JSON arrays/objects
+- `--plain` emits tab-separated lines
+- `--quiet` emits counts only
+
 | Command | Key flags | What it does |
 |---------|-----------|--------------|
 | `contacts list` | `--limit`, `--json` | List all contacts |

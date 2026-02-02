@@ -9,6 +9,8 @@ public struct contactbook: AsyncParsableCommand {
         abstract: "Apple Contacts CLI and MCP server",
         version: "1.0.0",
         subcommands: [
+            StatusCommand.self,
+            AuthorizeCommand.self,
             ContactsCommand.self,
             GroupsCommand.self,
             MCPCommand.self,

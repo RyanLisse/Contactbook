@@ -5,6 +5,63 @@ public actor ContactsService {
 
     private init() {}
 
+    /// Escapes a string for safe use in AppleScript double-quoted strings.
+    /// Must escape backslashes first, then double quotes.
+    private func escapeForAppleScript(_ input: String) -> String {
+        input
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+    }
+
+    // MARK: - Authorization
+
+    public func authorizationStatus() -> ContactsAuthorizationStatus {
+        let script = """
+        tell application "Contacts"
+            try
+                count of people
+                return "authorized"
+            on error errMsg
+                if errMsg contains "not allowed" or errMsg contains "denied" then
+                    return "denied"
+                else
+                    return "error"
+                end if
+            end try
+        end tell
+        """
+
+        do {
+            let result = try runAppleScript(script, timeout: 10)
+            if result == "authorized" || Int(result) != nil {
+                return .authorized
+            } else if result == "denied" {
+                return .denied
+            }
+            return .notDetermined
+        } catch {
+            return .notDetermined
+        }
+    }
+
+    public func requestAuthorization() async throws -> ContactsAuthorizationStatus {
+        let script = """
+        tell application "Contacts"
+            count of people
+        end tell
+        """
+
+        do {
+            _ = try runAppleScript(script, timeout: 30)
+            return .authorized
+        } catch let error as ContactsError {
+            if case .scriptError(let msg) = error, msg.contains("not allowed") || msg.contains("denied") {
+                return .denied
+            }
+            throw error
+        }
+    }
+
     // MARK: - AppleScript Execution
 
     private func runAppleScript(_ script: String, timeout: TimeInterval = 120) throws -> String {
@@ -19,15 +76,13 @@ public actor ContactsService {
 
         try process.run()
 
-        let deadline = Date().addingTimeInterval(timeout)
-        while process.isRunning && Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.1)
-        }
-
-        if process.isRunning {
+        let workItem = DispatchWorkItem {
             process.terminate()
-            return ""
         }
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: workItem)
+
+        process.waitUntilExit()
+        workItem.cancel()
 
         let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
         let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
@@ -100,7 +155,7 @@ public actor ContactsService {
     // MARK: - Search Contacts
 
     public func searchContacts(query: String) async throws -> [Contact] {
-        let escapedQuery = query.replacingOccurrences(of: "\"", with: "\\\"")
+        let escapedQuery = escapeForAppleScript(query)
 
         let script = """
         tell application "Contacts"
@@ -155,7 +210,7 @@ public actor ContactsService {
     // MARK: - Get Contact
 
     public func getContact(id: String) async throws -> Contact? {
-        let escapedId = id.replacingOccurrences(of: "\"", with: "\\\"")
+        let escapedId = escapeForAppleScript(id)
 
         let script = """
         tell application "Contacts"
@@ -220,12 +275,12 @@ public actor ContactsService {
         jobTitle: String?,
         note: String?
     ) async throws -> String {
-        let fn = (firstName ?? "").replacingOccurrences(of: "\"", with: "\\\"")
-        let ln = (lastName ?? "").replacingOccurrences(of: "\"", with: "\\\"")
-        let org = (organization ?? "").replacingOccurrences(of: "\"", with: "\\\"")
-        let jt = (jobTitle ?? "").replacingOccurrences(of: "\"", with: "\\\"")
-        let em = (email ?? "").replacingOccurrences(of: "\"", with: "\\\"")
-        let ph = (phone ?? "").replacingOccurrences(of: "\"", with: "\\\"")
+        let fn = escapeForAppleScript(firstName ?? "")
+        let ln = escapeForAppleScript(lastName ?? "")
+        let org = escapeForAppleScript(organization ?? "")
+        let jt = escapeForAppleScript(jobTitle ?? "")
+        let em = escapeForAppleScript(email ?? "")
+        let ph = escapeForAppleScript(phone ?? "")
 
         var setProps = "set newPerson to make new person with properties {"
         var props: [String] = []
@@ -268,20 +323,20 @@ public actor ContactsService {
         jobTitle: String?,
         note: String?
     ) async throws -> Bool {
-        let escapedId = id.replacingOccurrences(of: "\"", with: "\\\"")
+        let escapedId = escapeForAppleScript(id)
 
         var updates: [String] = []
         if let fn = firstName {
-            updates.append("set first name of p to \"\(fn.replacingOccurrences(of: "\"", with: "\\\""))\"")
+            updates.append("set first name of p to \"\(escapeForAppleScript(fn))\"")
         }
         if let ln = lastName {
-            updates.append("set last name of p to \"\(ln.replacingOccurrences(of: "\"", with: "\\\""))\"")
+            updates.append("set last name of p to \"\(escapeForAppleScript(ln))\"")
         }
         if let org = organization {
-            updates.append("set organization of p to \"\(org.replacingOccurrences(of: "\"", with: "\\\""))\"")
+            updates.append("set organization of p to \"\(escapeForAppleScript(org))\"")
         }
         if let jt = jobTitle {
-            updates.append("set job title of p to \"\(jt.replacingOccurrences(of: "\"", with: "\\\""))\"")
+            updates.append("set job title of p to \"\(escapeForAppleScript(jt))\"")
         }
 
         guard !updates.isEmpty else { return false }
@@ -306,7 +361,7 @@ public actor ContactsService {
     // MARK: - Delete Contact
 
     public func deleteContact(id: String) async throws -> Bool {
-        let escapedId = id.replacingOccurrences(of: "\"", with: "\\\"")
+        let escapedId = escapeForAppleScript(id)
 
         let script = """
         tell application "Contacts"
@@ -348,7 +403,7 @@ public actor ContactsService {
     }
 
     public func getGroupMembers(groupName: String) async throws -> [Contact] {
-        let escapedName = groupName.replacingOccurrences(of: "\"", with: "\\\"")
+        let escapedName = escapeForAppleScript(groupName)
 
         let script = """
         tell application "Contacts"
@@ -410,16 +465,18 @@ public actor ContactsService {
         guard !normalizedInput.isEmpty else { return nil }
 
         // Use last 7 digits for matching (handles international formats)
+        // Note: searchSuffix is guaranteed to contain only digits (0-9) after normalization,
+        // so it's safe to interpolate directly into AppleScript without escaping
         let searchSuffix = normalizedInput.count >= 7 ? String(normalizedInput.suffix(7)) : normalizedInput
 
-        // Optimized AppleScript: returns immediately on first match
-        // Uses longer timeout for large contact databases
         let script = """
         with timeout of 300 seconds
             tell application "Contacts"
                 repeat with p in people
                     repeat with ph in phones of p
-                        if value of ph contains "\(searchSuffix)" then
+                        set phoneVal to value of ph
+                        set cleanPhone to do shell script "echo " & quoted form of phoneVal & " | tr -cd '0-9'"
+                        if cleanPhone ends with "\(searchSuffix)" then
                             set contactId to id of p
                             set firstName to first name of p
                             set lastName to last name of p
@@ -462,7 +519,6 @@ public actor ContactsService {
         end timeout
         """
 
-        // Use 180 second timeout for Process execution (matches AppleScript timeout)
         let result = try runAppleScript(script, timeout: 180)
         if result.isEmpty {
             return nil
