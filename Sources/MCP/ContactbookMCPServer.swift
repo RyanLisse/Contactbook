@@ -31,5 +31,10 @@ public actor ContactbookMCPServer {
         }
 
         try await server.start(transport: transport)
+        // Block until the background message-handling task finishes.
+        // Without this, `start()` returns immediately (it spawns the loop
+        // as a detached Task), `run()` returns, the command exits, and the
+        // MCP server never services a single message.
+        await server.waitUntilCompleted()
     }
 }
