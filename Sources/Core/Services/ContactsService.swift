@@ -1,5 +1,30 @@
 import Foundation
 
+/// Lock-guarded box for pipe output collected on background queues.
+/// Needed because `readDataToEndOfFile` must run concurrently with the process
+/// (see `runAppleScript`), and strict concurrency forbids mutating captured vars.
+private final class PipeSink: @unchecked Sendable {
+    private let lock = NSLock()
+    private var out = Data()
+    private var err = Data()
+
+    func setStandardOutput(_ data: Data) {
+        lock.lock(); out = data; lock.unlock()
+    }
+
+    func setStandardError(_ data: Data) {
+        lock.lock(); err = data; lock.unlock()
+    }
+
+    var standardOutput: Data {
+        lock.lock(); defer { lock.unlock() }; return out
+    }
+
+    var standardError: Data {
+        lock.lock(); defer { lock.unlock() }; return err
+    }
+}
+
 public actor ContactsService {
     public static let shared = ContactsService()
 
@@ -19,6 +44,21 @@ public actor ContactsService {
 
         try process.run()
 
+        // Drain both pipes on background queues *while* the process runs. Reading only
+        // after exit deadlocks as soon as osascript writes more than the ~64 KB pipe
+        // buffer: it blocks on write, never exits, and the poll loop below then hits the
+        // timeout. That is what made any large `contacts list` hang.
+        let ioGroup = DispatchGroup()
+        let ioQueue = DispatchQueue(label: "contactbook.applescript.io", attributes: .concurrent)
+        let sink = PipeSink()
+
+        ioQueue.async(group: ioGroup) {
+            sink.setStandardOutput(outputPipe.fileHandleForReading.readDataToEndOfFile())
+        }
+        ioQueue.async(group: ioGroup) {
+            sink.setStandardError(errorPipe.fileHandleForReading.readDataToEndOfFile())
+        }
+
         let deadline = Date().addingTimeInterval(timeout)
         while process.isRunning && Date() < deadline {
             Thread.sleep(forTimeInterval: 0.1)
@@ -26,18 +66,26 @@ public actor ContactsService {
 
         if process.isRunning {
             process.terminate()
-            return ""
+            _ = ioGroup.wait(timeout: .now() + 5)
+            // Surface the timeout instead of returning "" — an empty string parses as
+            // "no contacts", which is indistinguishable from a genuinely empty result
+            // and silently hides the real failure from callers (and from MCP clients).
+            throw ContactsError.operationFailed(
+                "AppleScript timed out after \(Int(timeout))s (Contacts.app may be busy or syncing)"
+            )
         }
 
-        let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
-        let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+        // Both reads end when osascript closes its descriptors on exit.
+        ioGroup.wait()
+        let outData = sink.standardOutput
+        let errData = sink.standardError
 
         if process.terminationStatus != 0 {
-            let errorString = String(data: errorData, encoding: .utf8) ?? "Unknown error"
+            let errorString = String(data: errData, encoding: .utf8) ?? "Unknown error"
             throw ContactsError.scriptError(errorString)
         }
 
-        return String(data: outputData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return String(data: outData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 
     // MARK: - List Contacts
@@ -45,52 +93,87 @@ public actor ContactsService {
     public func listContacts(limit: Int? = nil) async throws -> [Contact] {
         let maxCount = limit ?? 50
 
+        // Fetch each property for ALL people in one Apple Event (`first name of people`)
+        // rather than looping `repeat with p in people` and reading properties per
+        // contact. The old form cost one round-trip per property per contact — roughly
+        // 1.9 s/contact against a 1900-contact database, so any sizeable limit blew the
+        // timeout and (before the fix above) came back as an empty list. Bulk fetching
+        // is ~7 s for the whole database regardless of limit; the loop below is then
+        // pure local list indexing.
         let script = """
-        tell application "Contacts"
-            set output to ""
-            set contactCount to 0
-            repeat with p in people
-                if contactCount >= \(maxCount) then exit repeat
-                set contactId to id of p
-                set firstName to first name of p
-                set lastName to last name of p
-                set orgName to organization of p
-                set jobTitleVal to job title of p
-                set noteVal to note of p
-                set birthdayVal to ""
-                try
-                    set birthdayVal to birth date of p as string
-                end try
+        on txt(v)
+            if v is missing value then return "missing value"
+            try
+                return v as string
+            on error
+                return ""
+            end try
+        end txt
 
-                set emailList to ""
-                repeat with e in emails of p
-                    if emailList is not "" then set emailList to emailList & ";;;"
-                    set emailList to emailList & (value of e)
-                end repeat
+        on cleanTxt(v)
+            set s to my txt(v)
+            -- notes may contain newlines/tabs, which would corrupt the record format
+            set AppleScript's text item delimiters to {return, linefeed, tab}
+            set parts to text items of s
+            set AppleScript's text item delimiters to " "
+            set s to parts as string
+            set AppleScript's text item delimiters to ""
+            return s
+        end cleanTxt
 
-                set phoneList to ""
-                repeat with ph in phones of p
-                    if phoneList is not "" then set phoneList to phoneList & ";;;"
-                    set phoneList to phoneList & (value of ph)
-                end repeat
-
-                set addrList to ""
-                repeat with a in addresses of p
-                    if addrList is not "" then set addrList to addrList & ";;;"
-                    set addrParts to ""
-                    try
-                        set addrParts to (street of a) & ", " & (city of a) & ", " & (state of a) & " " & (zip of a) & ", " & (country of a)
-                    end try
-                    set addrList to addrList & addrParts
-                end repeat
-
-                set recordLine to contactId & "\t" & firstName & "\t" & lastName & "\t" & orgName & "\t" & jobTitleVal & "\t" & noteVal & "\t" & birthdayVal & "\t" & emailList & "\t" & phoneList & "\t" & addrList
-                if output is not "" then set output to output & linefeed
-                set output to output & recordLine
-                set contactCount to contactCount + 1
+        on joinVals(lst)
+            if lst is missing value then return ""
+            set out to ""
+            repeat with v in lst
+                set s to my txt(contents of v)
+                if s is "missing value" then set s to ""
+                if s is not "" then
+                    if out is not "" then set out to out & ";;;"
+                    set out to out & s
+                end if
             end repeat
-            return output
+            return out
+        end joinVals
+
+        tell application "Contacts"
+            set ids to id of people
+            set firsts to first name of people
+            set lasts to last name of people
+            set orgs to organization of people
+            set jobsL to job title of people
+            set notesL to note of people
+            set bdays to birth date of people
+            set emailsAll to value of emails of people
+            set phonesAll to value of phones of people
+            set stAll to street of addresses of people
+            set ctAll to city of addresses of people
+            set staAll to state of addresses of people
+            set zipAll to zip of addresses of people
+            set cnAll to country of addresses of people
         end tell
+
+        set n to count of ids
+        if \(maxCount) < n then set n to \(maxCount)
+
+        set output to ""
+        repeat with i from 1 to n
+            set addrOut to ""
+            set streets to item i of stAll
+            if streets is not missing value then
+                repeat with j from 1 to (count of streets)
+                    set part to my txt(item j of streets)
+                    if part is "missing value" then set part to ""
+                    set part to part & ", " & my txt(item j of (item i of ctAll)) & ", " & my txt(item j of (item i of staAll)) & " " & my txt(item j of (item i of zipAll)) & ", " & my txt(item j of (item i of cnAll))
+                    if addrOut is not "" then set addrOut to addrOut & ";;;"
+                    set addrOut to addrOut & part
+                end repeat
+            end if
+
+            set recordLine to my txt(item i of ids) & tab & my cleanTxt(item i of firsts) & tab & my cleanTxt(item i of lasts) & tab & my cleanTxt(item i of orgs) & tab & my cleanTxt(item i of jobsL) & tab & my cleanTxt(item i of notesL) & tab & my txt(item i of bdays) & tab & my joinVals(item i of emailsAll) & tab & my joinVals(item i of phonesAll) & tab & addrOut
+            if output is not "" then set output to output & linefeed
+            set output to output & recordLine
+        end repeat
+        return output
         """
 
         let result = try runAppleScript(script)
