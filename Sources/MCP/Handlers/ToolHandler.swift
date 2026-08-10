@@ -174,13 +174,14 @@ extension ToolHandler {
     public static let allTools: [Tool] = [
         Tool(
             name: "contacts_list",
-            description: "List all contacts from Apple Contacts. Optional: limit (int) to cap results.",
+            description: "List contacts from Apple Contacts. Optional: limit (int) caps the result; omitting it returns at most 50.",
             inputSchema: .object([
                 "type": .string("object"),
                 "properties": .object([
                     "limit": .object([
                         "type": .string("integer"),
-                        "description": .string("Maximum number of contacts to return")
+                        "minimum": .int(0),
+                        "description": .string("Maximum number of contacts to return. Omit for the default cap of 50; 0 returns none. This is a cap, not a request for all contacts — pass a large value for that.")
                     ])
                 ])
             ])

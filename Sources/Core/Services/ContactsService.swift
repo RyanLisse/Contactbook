@@ -20,6 +20,25 @@ private final class ResumeOnce: @unchecked Sendable {
     }
 }
 
+/// Sendable holder for the cancellable timeout, so `terminationHandler` — which is a
+/// `@Sendable` closure — can cancel it without capturing the non-Sendable work item.
+private final class TimeoutBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var item: DispatchWorkItem?
+
+    func set(_ item: DispatchWorkItem) {
+        lock.lock(); self.item = item; lock.unlock()
+    }
+
+    func cancel() {
+        lock.lock()
+        let pending = item
+        item = nil
+        lock.unlock()
+        pending?.cancel()
+    }
+}
+
 /// Lock-guarded box for pipe output collected on background queues.
 /// Needed because `readDataToEndOfFile` must run concurrently with the process
 /// (see `runAppleScript`), and strict concurrency forbids mutating captured vars.
@@ -71,49 +90,108 @@ public actor ContactsService {
         let sink = PipeSink()
         let resume = ResumeOnce()
 
+        // The reads must join `ioGroup` *before* the process can terminate. Enqueued
+        // after `process.run()`, a fast script could fire terminationHandler first,
+        // resuming the task while the group is still empty — `notify` would then fire
+        // immediately and hand back empty or truncated output, i.e. the same silent ""
+        // this method exists to prevent. Reading before launch is safe: the read blocks
+        // until data arrives or every write end closes.
+        ioQueue.async(group: ioGroup) {
+            sink.setStandardOutput(outputPipe.fileHandleForReading.readDataToEndOfFile())
+        }
+        ioQueue.async(group: ioGroup) {
+            sink.setStandardError(errorPipe.fileHandleForReading.readDataToEndOfFile())
+        }
+
         // Wait for the process by event, not by polling. This method is called on the
         // ContactsService actor, so a sleep-poll loop would hold a cooperative-pool
         // thread for the whole timeout (180 s in lookupByPhone) while doing nothing,
         // starving other concurrent MCP tool calls.
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            process.terminationHandler = { _ in
-                resume.once { continuation.resume() }
-            }
-
-            do {
-                try process.run()
-            } catch {
-                resume.once { continuation.resume(throwing: error) }
-                return
-            }
-
-            ioQueue.async(group: ioGroup) {
-                sink.setStandardOutput(outputPipe.fileHandleForReading.readDataToEndOfFile())
-            }
-            ioQueue.async(group: ioGroup) {
-                sink.setStandardError(errorPipe.fileHandleForReading.readDataToEndOfFile())
-            }
-
-            ioQueue.asyncAfter(deadline: .now() + timeout) {
-                guard process.isRunning else { return }
-                process.terminate()
-                // Surface the timeout instead of returning "" — an empty string parses
-                // as "no contacts", indistinguishable from a genuinely empty result,
-                // which hides the real failure from callers (and from MCP clients).
-                resume.once {
-                    continuation.resume(
-                        throwing: ContactsError.operationFailed(
-                            "AppleScript timed out after \(Int(timeout))s (Contacts.app may be busy or syncing)"
+        //
+        // A failure here is carried rather than thrown, so the pipes are always drained
+        // and closed before it propagates.
+        var failure: Error?
+        do {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                // Cancellable, so a call that finishes in 1 s with `timeout: 180` does not
+                // keep the block — and everything it captures — scheduled for the full 180 s.
+                // That retention would otherwise accumulate in the long-running MCP server.
+                let timeoutBox = TimeoutBox()
+                let timeoutWork = DispatchWorkItem {
+                    guard process.isRunning else { return }
+                    process.terminate()
+                    // Surface the timeout instead of returning "" — an empty string parses
+                    // as "no contacts", indistinguishable from a genuinely empty result,
+                    // which hides the real failure from callers (and from MCP clients).
+                    resume.once {
+                        continuation.resume(
+                            throwing: ContactsError.operationFailed(
+                                "AppleScript timed out after \(Int(timeout))s (Contacts.app may be busy or syncing)"
+                            )
                         )
-                    )
+                    }
                 }
+                timeoutBox.set(timeoutWork)
+
+                process.terminationHandler = { _ in
+                    timeoutBox.cancel()
+                    resume.once { continuation.resume() }
+                }
+
+                do {
+                    try process.run()
+                } catch {
+                    timeoutBox.cancel()
+                    // Nothing will ever write to or close these, so end the reads ourselves;
+                    // otherwise the two queued readDataToEndOfFile calls block forever.
+                    outputPipe.fileHandleForWriting.closeFile()
+                    errorPipe.fileHandleForWriting.closeFile()
+                    resume.once { continuation.resume(throwing: error) }
+                    return
+                }
+
+                ioQueue.asyncAfter(deadline: .now() + timeout, execute: timeoutWork)
             }
+        } catch {
+            failure = error
         }
 
-        // Both reads end when osascript closes its descriptors on exit. Awaiting the
-        // group rather than calling wait() keeps this off the actor's thread too.
+        return try await finishAppleScript(
+            process: process,
+            outputPipe: outputPipe,
+            errorPipe: errorPipe,
+            ioGroup: ioGroup,
+            ioQueue: ioQueue,
+            sink: sink,
+            failure: failure
+        )
+    }
+
+    /// Drains the pipes, releases their descriptors and turns the result into output.
+    /// Runs on every exit path — including the timeout — so the read handles are always
+    /// closed rather than left to `Pipe` deinit. In the MCP server the actor lives for
+    /// the whole session, so per-call descriptors would otherwise accumulate.
+    private func finishAppleScript(
+        process: Process,
+        outputPipe: Pipe,
+        errorPipe: Pipe,
+        ioGroup: DispatchGroup,
+        ioQueue: DispatchQueue,
+        sink: PipeSink,
+        failure: Error?
+    ) async throws -> String {
+        // Both reads end when osascript closes its descriptors, on exit or on terminate().
+        // Awaiting the group rather than calling wait() keeps this off the actor's thread,
+        // and guarantees no read is still in flight when the handles are closed below.
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             ioGroup.notify(queue: ioQueue) { continuation.resume() }
+        }
+
+        outputPipe.fileHandleForReading.closeFile()
+        errorPipe.fileHandleForReading.closeFile()
+
+        if let failure {
+            throw failure
         }
 
         let outData = sink.standardOutput
@@ -129,8 +207,17 @@ public actor ContactsService {
 
     // MARK: - List Contacts
 
+    /// - Parameter limit: maximum number of contacts to return. `nil` applies the
+    ///   default cap of 50; a positive value caps the result; zero or negative returns
+    ///   no contacts. It is a cap, never a request for "everything" — pass a large
+    ///   value for that.
     public func listContacts(limit: Int? = nil) async throws -> [Contact] {
-        let maxCount = max(1, limit ?? 50)
+        let maxCount = limit ?? 50
+
+        // Zero or negative asks for nothing, so skip the AppleScript entirely rather
+        // than paying for a full fetch and discarding it. (An earlier revision clamped
+        // this to 1, which silently turned `limit: 0` into a single contact.)
+        guard maxCount > 0 else { return [] }
 
         // Fetch each property for ALL people in one Apple Event (`first name of people`)
         // rather than looping `repeat with p in people` and reading properties per
@@ -173,7 +260,9 @@ public actor ContactsService {
             if lst is missing value then return ""
             set out to ""
             repeat with v in lst
-                set s to my txt(contents of v)
+                -- cleanTxt, not txt: an email or phone containing a tab or newline
+                -- would otherwise split one record into two on the Swift side
+                set s to my cleanTxt(contents of v)
                 if s is "missing value" then set s to ""
                 if s is not "" then
                     if out is not "" then set out to out & ";;;"
@@ -593,7 +682,10 @@ public actor ContactsService {
         end timeout
         """
 
-        // Use 180 second timeout for Process execution (matches AppleScript timeout)
+        // The process timeout deliberately bounds the script's own `with timeout of 300
+        // seconds` above: osascript is killed at 180 s, so the 300 s AppleScript timeout
+        // is never reached. Raising this past 300 would make the script's timeout the
+        // effective one. (The comment previously claimed the two matched; they never did.)
         let result = try await runAppleScript(script, timeout: 180)
         if result.isEmpty {
             return nil
