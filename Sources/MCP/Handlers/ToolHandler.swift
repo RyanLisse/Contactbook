@@ -176,6 +176,7 @@ extension ToolHandler {
             name: "contacts_list",
             description: "List all contacts from Apple Contacts. Optional: limit (int) to cap results.",
             inputSchema: .object([
+                "type": .string("object"),
                 "properties": .object([
                     "limit": .object([
                         "type": .string("integer"),
@@ -188,6 +189,7 @@ extension ToolHandler {
             name: "contacts_search",
             description: "Search contacts by name, email, phone, or organization. Required: query (string).",
             inputSchema: .object([
+                "type": .string("object"),
                 "properties": .object([
                     "query": .object([
                         "type": .string("string"),
@@ -201,6 +203,7 @@ extension ToolHandler {
             name: "contacts_get",
             description: "Get a contact by ID with full details. Required: id (string).",
             inputSchema: .object([
+                "type": .string("object"),
                 "properties": .object([
                     "id": .object([
                         "type": .string("string"),
@@ -214,6 +217,7 @@ extension ToolHandler {
             name: "contacts_create",
             description: "Create a new contact. At least one of firstName, lastName, or organization required. Optional: email, phone, jobTitle, note.",
             inputSchema: .object([
+                "type": .string("object"),
                 "properties": .object([
                     "firstName": .object([
                         "type": .string("string"),
@@ -250,6 +254,7 @@ extension ToolHandler {
             name: "contacts_update",
             description: "Update an existing contact. Required: id (string). Optional: firstName, lastName, organization, jobTitle, note.",
             inputSchema: .object([
+                "type": .string("object"),
                 "properties": .object([
                     "id": .object([
                         "type": .string("string"),
@@ -283,6 +288,7 @@ extension ToolHandler {
             name: "contacts_delete",
             description: "Delete a contact. Required: id (string).",
             inputSchema: .object([
+                "type": .string("object"),
                 "properties": .object([
                     "id": .object([
                         "type": .string("string"),
@@ -295,12 +301,13 @@ extension ToolHandler {
         Tool(
             name: "groups_list",
             description: "List all contact groups with member counts.",
-            inputSchema: .object([:])
+            inputSchema: .object(["type": .string("object")])
         ),
         Tool(
             name: "groups_members",
             description: "Get all contacts in a group. Required: name (string) - the group name.",
             inputSchema: .object([
+                "type": .string("object"),
                 "properties": .object([
                     "name": .object([
                         "type": .string("string"),
