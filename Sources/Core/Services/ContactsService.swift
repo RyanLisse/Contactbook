@@ -1,5 +1,69 @@
 import Foundation
 
+/// Guarantees a continuation is resumed exactly once.
+/// `runAppleScript` can be woken by either the process terminating or the timeout
+/// firing, and both may happen (terminate() triggers the termination handler).
+private final class ResumeOnce: @unchecked Sendable {
+    private let lock = NSLock()
+    private var done = false
+
+    /// Runs `body` only for the first caller; later callers are ignored.
+    func once(_ body: () -> Void) {
+        lock.lock()
+        let shouldRun = !done
+        done = true
+        lock.unlock()
+
+        if shouldRun {
+            body()
+        }
+    }
+}
+
+/// Sendable holder for the cancellable timeout, so `terminationHandler` — which is a
+/// `@Sendable` closure — can cancel it without capturing the non-Sendable work item.
+private final class TimeoutBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var item: DispatchWorkItem?
+
+    func set(_ item: DispatchWorkItem) {
+        lock.lock(); self.item = item; lock.unlock()
+    }
+
+    func cancel() {
+        lock.lock()
+        let pending = item
+        item = nil
+        lock.unlock()
+        pending?.cancel()
+    }
+}
+
+/// Lock-guarded box for pipe output collected on background queues.
+/// Needed because `readDataToEndOfFile` must run concurrently with the process
+/// (see `runAppleScript`), and strict concurrency forbids mutating captured vars.
+private final class PipeSink: @unchecked Sendable {
+    private let lock = NSLock()
+    private var out = Data()
+    private var err = Data()
+
+    func setStandardOutput(_ data: Data) {
+        lock.lock(); out = data; lock.unlock()
+    }
+
+    func setStandardError(_ data: Data) {
+        lock.lock(); err = data; lock.unlock()
+    }
+
+    var standardOutput: Data {
+        lock.lock(); defer { lock.unlock() }; return out
+    }
+
+    var standardError: Data {
+        lock.lock(); defer { lock.unlock() }; return err
+    }
+}
+
 public actor ContactsService {
     public static let shared = ContactsService()
 
@@ -7,7 +71,7 @@ public actor ContactsService {
 
     // MARK: - AppleScript Execution
 
-    private func runAppleScript(_ script: String, timeout: TimeInterval = 120) throws -> String {
+    private func runAppleScript(_ script: String, timeout: TimeInterval = 120) async throws -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
         process.arguments = ["-e", script]
@@ -17,83 +81,239 @@ public actor ContactsService {
         process.standardOutput = outputPipe
         process.standardError = errorPipe
 
-        try process.run()
+        // Drain both pipes on background queues *while* the process runs. Reading only
+        // after exit deadlocks as soon as osascript writes more than the ~64 KB pipe
+        // buffer: it blocks on write and never exits. That is what made any large
+        // `contacts list` hang.
+        let ioGroup = DispatchGroup()
+        let ioQueue = DispatchQueue(label: "contactbook.applescript.io", attributes: .concurrent)
+        let sink = PipeSink()
+        let resume = ResumeOnce()
 
-        let deadline = Date().addingTimeInterval(timeout)
-        while process.isRunning && Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.1)
+        // The reads must join `ioGroup` *before* the process can terminate. Enqueued
+        // after `process.run()`, a fast script could fire terminationHandler first,
+        // resuming the task while the group is still empty — `notify` would then fire
+        // immediately and hand back empty or truncated output, i.e. the same silent ""
+        // this method exists to prevent. Reading before launch is safe: the read blocks
+        // until data arrives or every write end closes.
+        ioQueue.async(group: ioGroup) {
+            sink.setStandardOutput(outputPipe.fileHandleForReading.readDataToEndOfFile())
+        }
+        ioQueue.async(group: ioGroup) {
+            sink.setStandardError(errorPipe.fileHandleForReading.readDataToEndOfFile())
         }
 
-        if process.isRunning {
-            process.terminate()
-            return ""
+        // Wait for the process by event, not by polling. This method is called on the
+        // ContactsService actor, so a sleep-poll loop would hold a cooperative-pool
+        // thread for the whole timeout (180 s in lookupByPhone) while doing nothing,
+        // starving other concurrent MCP tool calls.
+        //
+        // A failure here is carried rather than thrown, so the pipes are always drained
+        // and closed before it propagates.
+        var failure: Error?
+        do {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                // Cancellable, so a call that finishes in 1 s with `timeout: 180` does not
+                // keep the block — and everything it captures — scheduled for the full 180 s.
+                // That retention would otherwise accumulate in the long-running MCP server.
+                let timeoutBox = TimeoutBox()
+                let timeoutWork = DispatchWorkItem {
+                    guard process.isRunning else { return }
+                    process.terminate()
+                    // Surface the timeout instead of returning "" — an empty string parses
+                    // as "no contacts", indistinguishable from a genuinely empty result,
+                    // which hides the real failure from callers (and from MCP clients).
+                    resume.once {
+                        continuation.resume(
+                            throwing: ContactsError.operationFailed(
+                                "AppleScript timed out after \(Int(timeout))s (Contacts.app may be busy or syncing)"
+                            )
+                        )
+                    }
+                }
+                timeoutBox.set(timeoutWork)
+
+                process.terminationHandler = { _ in
+                    timeoutBox.cancel()
+                    resume.once { continuation.resume() }
+                }
+
+                do {
+                    try process.run()
+                } catch {
+                    timeoutBox.cancel()
+                    // Nothing will ever write to or close these, so end the reads ourselves;
+                    // otherwise the two queued readDataToEndOfFile calls block forever.
+                    outputPipe.fileHandleForWriting.closeFile()
+                    errorPipe.fileHandleForWriting.closeFile()
+                    resume.once { continuation.resume(throwing: error) }
+                    return
+                }
+
+                ioQueue.asyncAfter(deadline: .now() + timeout, execute: timeoutWork)
+            }
+        } catch {
+            failure = error
         }
 
-        let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
-        let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+        return try await finishAppleScript(
+            process: process,
+            outputPipe: outputPipe,
+            errorPipe: errorPipe,
+            ioGroup: ioGroup,
+            ioQueue: ioQueue,
+            sink: sink,
+            failure: failure
+        )
+    }
+
+    /// Drains the pipes, releases their descriptors and turns the result into output.
+    /// Runs on every exit path — including the timeout — so the read handles are always
+    /// closed rather than left to `Pipe` deinit. In the MCP server the actor lives for
+    /// the whole session, so per-call descriptors would otherwise accumulate.
+    private func finishAppleScript(
+        process: Process,
+        outputPipe: Pipe,
+        errorPipe: Pipe,
+        ioGroup: DispatchGroup,
+        ioQueue: DispatchQueue,
+        sink: PipeSink,
+        failure: Error?
+    ) async throws -> String {
+        // Both reads end when osascript closes its descriptors, on exit or on terminate().
+        // Awaiting the group rather than calling wait() keeps this off the actor's thread,
+        // and guarantees no read is still in flight when the handles are closed below.
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            ioGroup.notify(queue: ioQueue) { continuation.resume() }
+        }
+
+        outputPipe.fileHandleForReading.closeFile()
+        errorPipe.fileHandleForReading.closeFile()
+
+        if let failure {
+            throw failure
+        }
+
+        let outData = sink.standardOutput
+        let errData = sink.standardError
 
         if process.terminationStatus != 0 {
-            let errorString = String(data: errorData, encoding: .utf8) ?? "Unknown error"
+            let errorString = String(data: errData, encoding: .utf8) ?? "Unknown error"
             throw ContactsError.scriptError(errorString)
         }
 
-        return String(data: outputData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return String(data: outData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 
     // MARK: - List Contacts
 
+    /// - Parameter limit: maximum number of contacts to return. `nil` applies the
+    ///   default cap of 50; a positive value caps the result; zero or negative returns
+    ///   no contacts. It is a cap, never a request for "everything" — pass a large
+    ///   value for that.
     public func listContacts(limit: Int? = nil) async throws -> [Contact] {
         let maxCount = limit ?? 50
 
+        // Zero or negative asks for nothing, so skip the AppleScript entirely rather
+        // than paying for a full fetch and discarding it. (An earlier revision clamped
+        // this to 1, which silently turned `limit: 0` into a single contact.)
+        guard maxCount > 0 else { return [] }
+
+        // Fetch each property for ALL people in one Apple Event (`first name of people`)
+        // rather than looping `repeat with p in people` and reading properties per
+        // contact. The old form cost one round-trip per property per contact — roughly
+        // 1.9 s/contact against a 1900-contact database, so any sizeable limit blew the
+        // timeout and came back as an empty list. The loop below is then pure local
+        // list indexing.
+        //
+        // Fetching everything and trimming afterwards looks wasteful but is by far the
+        // fastest option here, and the alternative was measured rather than assumed:
+        //   - `id of people`                  -> 1932 records in ~0.85 s
+        //   - `id of people 1 thru 200`       -> 200 records in ~75 s
+        //   - `set p to people 1 thru n` then
+        //     `id of p`                       -> error -1728 (can't read a materialised
+        //                                        list with the bulk-property form)
+        // Contacts resolves a range element-by-element, so asking for less costs ~90x
+        // more. The whole-collection specifier is the only fast path.
         let script = """
-        tell application "Contacts"
-            set output to ""
-            set contactCount to 0
-            repeat with p in people
-                if contactCount >= \(maxCount) then exit repeat
-                set contactId to id of p
-                set firstName to first name of p
-                set lastName to last name of p
-                set orgName to organization of p
-                set jobTitleVal to job title of p
-                set noteVal to note of p
-                set birthdayVal to ""
-                try
-                    set birthdayVal to birth date of p as string
-                end try
+        on txt(v)
+            if v is missing value then return "missing value"
+            try
+                return v as string
+            on error
+                return ""
+            end try
+        end txt
 
-                set emailList to ""
-                repeat with e in emails of p
-                    if emailList is not "" then set emailList to emailList & ";;;"
-                    set emailList to emailList & (value of e)
-                end repeat
+        on cleanTxt(v)
+            set s to my txt(v)
+            -- notes may contain newlines/tabs, which would corrupt the record format
+            set AppleScript's text item delimiters to {return, linefeed, tab}
+            set parts to text items of s
+            set AppleScript's text item delimiters to " "
+            set s to parts as string
+            set AppleScript's text item delimiters to ""
+            return s
+        end cleanTxt
 
-                set phoneList to ""
-                repeat with ph in phones of p
-                    if phoneList is not "" then set phoneList to phoneList & ";;;"
-                    set phoneList to phoneList & (value of ph)
-                end repeat
-
-                set addrList to ""
-                repeat with a in addresses of p
-                    if addrList is not "" then set addrList to addrList & ";;;"
-                    set addrParts to ""
-                    try
-                        set addrParts to (street of a) & ", " & (city of a) & ", " & (state of a) & " " & (zip of a) & ", " & (country of a)
-                    end try
-                    set addrList to addrList & addrParts
-                end repeat
-
-                set recordLine to contactId & "\t" & firstName & "\t" & lastName & "\t" & orgName & "\t" & jobTitleVal & "\t" & noteVal & "\t" & birthdayVal & "\t" & emailList & "\t" & phoneList & "\t" & addrList
-                if output is not "" then set output to output & linefeed
-                set output to output & recordLine
-                set contactCount to contactCount + 1
+        on joinVals(lst)
+            if lst is missing value then return ""
+            set out to ""
+            repeat with v in lst
+                -- cleanTxt, not txt: an email or phone containing a tab or newline
+                -- would otherwise split one record into two on the Swift side
+                set s to my cleanTxt(contents of v)
+                if s is "missing value" then set s to ""
+                if s is not "" then
+                    if out is not "" then set out to out & ";;;"
+                    set out to out & s
+                end if
             end repeat
-            return output
+            return out
+        end joinVals
+
+        tell application "Contacts"
+            set ids to id of people
+            set firsts to first name of people
+            set lasts to last name of people
+            set orgs to organization of people
+            set jobsL to job title of people
+            set notesL to note of people
+            set bdays to birth date of people
+            set emailsAll to value of emails of people
+            set phonesAll to value of phones of people
+            set stAll to street of addresses of people
+            set ctAll to city of addresses of people
+            set staAll to state of addresses of people
+            set zipAll to zip of addresses of people
+            set cnAll to country of addresses of people
         end tell
+
+        set n to count of ids
+        if \(maxCount) < n then set n to \(maxCount)
+
+        set output to ""
+        repeat with i from 1 to n
+            set addrOut to ""
+            set streets to item i of stAll
+            if streets is not missing value then
+                repeat with j from 1 to (count of streets)
+                    set part to my txt(item j of streets)
+                    if part is "missing value" then set part to ""
+                    set part to part & ", " & my txt(item j of (item i of ctAll)) & ", " & my txt(item j of (item i of staAll)) & " " & my txt(item j of (item i of zipAll)) & ", " & my txt(item j of (item i of cnAll))
+                    if addrOut is not "" then set addrOut to addrOut & ";;;"
+                    set addrOut to addrOut & part
+                end repeat
+            end if
+
+            set recordLine to my txt(item i of ids) & tab & my cleanTxt(item i of firsts) & tab & my cleanTxt(item i of lasts) & tab & my cleanTxt(item i of orgs) & tab & my cleanTxt(item i of jobsL) & tab & my cleanTxt(item i of notesL) & tab & my txt(item i of bdays) & tab & my joinVals(item i of emailsAll) & tab & my joinVals(item i of phonesAll) & tab & addrOut
+            if output is not "" then set output to output & linefeed
+            set output to output & recordLine
+        end repeat
+        return output
         """
 
-        let result = try runAppleScript(script)
+        let result = try await runAppleScript(script)
         return parseContacts(result)
     }
 
@@ -148,7 +368,7 @@ public actor ContactsService {
         end tell
         """
 
-        let result = try runAppleScript(script)
+        let result = try await runAppleScript(script)
         return parseContacts(result)
     }
 
@@ -201,7 +421,7 @@ public actor ContactsService {
         end tell
         """
 
-        let result = try runAppleScript(script)
+        let result = try await runAppleScript(script)
         if result.isEmpty {
             return nil
         }
@@ -255,7 +475,7 @@ public actor ContactsService {
         end tell
         """
 
-        return try runAppleScript(script)
+        return try await runAppleScript(script)
     }
 
     // MARK: - Update Contact
@@ -299,7 +519,7 @@ public actor ContactsService {
         end tell
         """
 
-        let result = try runAppleScript(script)
+        let result = try await runAppleScript(script)
         return result == "true"
     }
 
@@ -321,7 +541,7 @@ public actor ContactsService {
         end tell
         """
 
-        let result = try runAppleScript(script)
+        let result = try await runAppleScript(script)
         return result == "true"
     }
 
@@ -343,7 +563,7 @@ public actor ContactsService {
         end tell
         """
 
-        let result = try runAppleScript(script)
+        let result = try await runAppleScript(script)
         return parseGroups(result)
     }
 
@@ -389,16 +609,16 @@ public actor ContactsService {
                         set addrList to addrList & addrParts
                     end repeat
 
-                    set line to contactId & "\t" & firstName & "\t" & lastName & "\t" & orgName & "\t" & jobTitleVal & "\t" & noteVal & "\t" & birthdayVal & "\t" & emailList & "\t" & phoneList & "\t" & addrList
+                    set recordLine to contactId & "\t" & firstName & "\t" & lastName & "\t" & orgName & "\t" & jobTitleVal & "\t" & noteVal & "\t" & birthdayVal & "\t" & emailList & "\t" & phoneList & "\t" & addrList
                     if output is not "" then set output to output & linefeed
-                    set output to output & line
+                    set output to output & recordLine
                 end repeat
             end try
             return output
         end tell
         """
 
-        let result = try runAppleScript(script)
+        let result = try await runAppleScript(script)
         return parseContacts(result)
     }
 
@@ -462,8 +682,11 @@ public actor ContactsService {
         end timeout
         """
 
-        // Use 180 second timeout for Process execution (matches AppleScript timeout)
-        let result = try runAppleScript(script, timeout: 180)
+        // The process timeout deliberately bounds the script's own `with timeout of 300
+        // seconds` above: osascript is killed at 180 s, so the 300 s AppleScript timeout
+        // is never reached. Raising this past 300 would make the script's timeout the
+        // effective one. (The comment previously claimed the two matched; they never did.)
+        let result = try await runAppleScript(script, timeout: 180)
         if result.isEmpty {
             return nil
         }
