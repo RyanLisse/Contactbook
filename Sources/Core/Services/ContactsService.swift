@@ -389,9 +389,9 @@ public actor ContactsService {
                         set addrList to addrList & addrParts
                     end repeat
 
-                    set line to contactId & "\t" & firstName & "\t" & lastName & "\t" & orgName & "\t" & jobTitleVal & "\t" & noteVal & "\t" & birthdayVal & "\t" & emailList & "\t" & phoneList & "\t" & addrList
+                    set recordLine to contactId & "\t" & firstName & "\t" & lastName & "\t" & orgName & "\t" & jobTitleVal & "\t" & noteVal & "\t" & birthdayVal & "\t" & emailList & "\t" & phoneList & "\t" & addrList
                     if output is not "" then set output to output & linefeed
-                    set output to output & line
+                    set output to output & recordLine
                 end repeat
             end try
             return output

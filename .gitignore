@@ -6,3 +6,6 @@ DerivedData/
 .swiftpm/
 *.xcodeproj
 Package.resolved
+
+# Claude Code session image cache
+image-cache/
