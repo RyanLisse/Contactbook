@@ -1,5 +1,25 @@
 import Foundation
 
+/// Guarantees a continuation is resumed exactly once.
+/// `runAppleScript` can be woken by either the process terminating or the timeout
+/// firing, and both may happen (terminate() triggers the termination handler).
+private final class ResumeOnce: @unchecked Sendable {
+    private let lock = NSLock()
+    private var done = false
+
+    /// Runs `body` only for the first caller; later callers are ignored.
+    func once(_ body: () -> Void) {
+        lock.lock()
+        let shouldRun = !done
+        done = true
+        lock.unlock()
+
+        if shouldRun {
+            body()
+        }
+    }
+}
+
 /// Lock-guarded box for pipe output collected on background queues.
 /// Needed because `readDataToEndOfFile` must run concurrently with the process
 /// (see `runAppleScript`), and strict concurrency forbids mutating captured vars.
@@ -32,7 +52,7 @@ public actor ContactsService {
 
     // MARK: - AppleScript Execution
 
-    private func runAppleScript(_ script: String, timeout: TimeInterval = 120) throws -> String {
+    private func runAppleScript(_ script: String, timeout: TimeInterval = 120) async throws -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
         process.arguments = ["-e", script]
@@ -42,41 +62,60 @@ public actor ContactsService {
         process.standardOutput = outputPipe
         process.standardError = errorPipe
 
-        try process.run()
-
         // Drain both pipes on background queues *while* the process runs. Reading only
         // after exit deadlocks as soon as osascript writes more than the ~64 KB pipe
-        // buffer: it blocks on write, never exits, and the poll loop below then hits the
-        // timeout. That is what made any large `contacts list` hang.
+        // buffer: it blocks on write and never exits. That is what made any large
+        // `contacts list` hang.
         let ioGroup = DispatchGroup()
         let ioQueue = DispatchQueue(label: "contactbook.applescript.io", attributes: .concurrent)
         let sink = PipeSink()
+        let resume = ResumeOnce()
 
-        ioQueue.async(group: ioGroup) {
-            sink.setStandardOutput(outputPipe.fileHandleForReading.readDataToEndOfFile())
-        }
-        ioQueue.async(group: ioGroup) {
-            sink.setStandardError(errorPipe.fileHandleForReading.readDataToEndOfFile())
+        // Wait for the process by event, not by polling. This method is called on the
+        // ContactsService actor, so a sleep-poll loop would hold a cooperative-pool
+        // thread for the whole timeout (180 s in lookupByPhone) while doing nothing,
+        // starving other concurrent MCP tool calls.
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            process.terminationHandler = { _ in
+                resume.once { continuation.resume() }
+            }
+
+            do {
+                try process.run()
+            } catch {
+                resume.once { continuation.resume(throwing: error) }
+                return
+            }
+
+            ioQueue.async(group: ioGroup) {
+                sink.setStandardOutput(outputPipe.fileHandleForReading.readDataToEndOfFile())
+            }
+            ioQueue.async(group: ioGroup) {
+                sink.setStandardError(errorPipe.fileHandleForReading.readDataToEndOfFile())
+            }
+
+            ioQueue.asyncAfter(deadline: .now() + timeout) {
+                guard process.isRunning else { return }
+                process.terminate()
+                // Surface the timeout instead of returning "" — an empty string parses
+                // as "no contacts", indistinguishable from a genuinely empty result,
+                // which hides the real failure from callers (and from MCP clients).
+                resume.once {
+                    continuation.resume(
+                        throwing: ContactsError.operationFailed(
+                            "AppleScript timed out after \(Int(timeout))s (Contacts.app may be busy or syncing)"
+                        )
+                    )
+                }
+            }
         }
 
-        let deadline = Date().addingTimeInterval(timeout)
-        while process.isRunning && Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.1)
+        // Both reads end when osascript closes its descriptors on exit. Awaiting the
+        // group rather than calling wait() keeps this off the actor's thread too.
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            ioGroup.notify(queue: ioQueue) { continuation.resume() }
         }
 
-        if process.isRunning {
-            process.terminate()
-            _ = ioGroup.wait(timeout: .now() + 5)
-            // Surface the timeout instead of returning "" — an empty string parses as
-            // "no contacts", which is indistinguishable from a genuinely empty result
-            // and silently hides the real failure from callers (and from MCP clients).
-            throw ContactsError.operationFailed(
-                "AppleScript timed out after \(Int(timeout))s (Contacts.app may be busy or syncing)"
-            )
-        }
-
-        // Both reads end when osascript closes its descriptors on exit.
-        ioGroup.wait()
         let outData = sink.standardOutput
         let errData = sink.standardError
 
@@ -91,15 +130,24 @@ public actor ContactsService {
     // MARK: - List Contacts
 
     public func listContacts(limit: Int? = nil) async throws -> [Contact] {
-        let maxCount = limit ?? 50
+        let maxCount = max(1, limit ?? 50)
 
         // Fetch each property for ALL people in one Apple Event (`first name of people`)
         // rather than looping `repeat with p in people` and reading properties per
         // contact. The old form cost one round-trip per property per contact — roughly
         // 1.9 s/contact against a 1900-contact database, so any sizeable limit blew the
-        // timeout and (before the fix above) came back as an empty list. Bulk fetching
-        // is ~7 s for the whole database regardless of limit; the loop below is then
-        // pure local list indexing.
+        // timeout and came back as an empty list. The loop below is then pure local
+        // list indexing.
+        //
+        // Fetching everything and trimming afterwards looks wasteful but is by far the
+        // fastest option here, and the alternative was measured rather than assumed:
+        //   - `id of people`                  -> 1932 records in ~0.85 s
+        //   - `id of people 1 thru 200`       -> 200 records in ~75 s
+        //   - `set p to people 1 thru n` then
+        //     `id of p`                       -> error -1728 (can't read a materialised
+        //                                        list with the bulk-property form)
+        // Contacts resolves a range element-by-element, so asking for less costs ~90x
+        // more. The whole-collection specifier is the only fast path.
         let script = """
         on txt(v)
             if v is missing value then return "missing value"
@@ -176,7 +224,7 @@ public actor ContactsService {
         return output
         """
 
-        let result = try runAppleScript(script)
+        let result = try await runAppleScript(script)
         return parseContacts(result)
     }
 
@@ -231,7 +279,7 @@ public actor ContactsService {
         end tell
         """
 
-        let result = try runAppleScript(script)
+        let result = try await runAppleScript(script)
         return parseContacts(result)
     }
 
@@ -284,7 +332,7 @@ public actor ContactsService {
         end tell
         """
 
-        let result = try runAppleScript(script)
+        let result = try await runAppleScript(script)
         if result.isEmpty {
             return nil
         }
@@ -338,7 +386,7 @@ public actor ContactsService {
         end tell
         """
 
-        return try runAppleScript(script)
+        return try await runAppleScript(script)
     }
 
     // MARK: - Update Contact
@@ -382,7 +430,7 @@ public actor ContactsService {
         end tell
         """
 
-        let result = try runAppleScript(script)
+        let result = try await runAppleScript(script)
         return result == "true"
     }
 
@@ -404,7 +452,7 @@ public actor ContactsService {
         end tell
         """
 
-        let result = try runAppleScript(script)
+        let result = try await runAppleScript(script)
         return result == "true"
     }
 
@@ -426,7 +474,7 @@ public actor ContactsService {
         end tell
         """
 
-        let result = try runAppleScript(script)
+        let result = try await runAppleScript(script)
         return parseGroups(result)
     }
 
@@ -481,7 +529,7 @@ public actor ContactsService {
         end tell
         """
 
-        let result = try runAppleScript(script)
+        let result = try await runAppleScript(script)
         return parseContacts(result)
     }
 
@@ -546,7 +594,7 @@ public actor ContactsService {
         """
 
         // Use 180 second timeout for Process execution (matches AppleScript timeout)
-        let result = try runAppleScript(script, timeout: 180)
+        let result = try await runAppleScript(script, timeout: 180)
         if result.isEmpty {
             return nil
         }
